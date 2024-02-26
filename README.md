@@ -2,4 +2,4 @@
 
 ## Contents
 
-**higher_education_disparities** In this project I explore the research institution landscape in the United States. Between Ivy Leagues I analyze the factors that contribute to their rankings given by the Shanghai Ranking Consultancy (SRC) as well as their geographic distribution in the United States. In presenting this analysis I question the legitimacy of their rankings and question the factors SRC contributes to their rank. 
+**higher_education_disparities:** In this research, I delve into the landscape of research institutions across the United States. Focusing particularly on Ivy League universities, I scrutinize the multifaceted elements influencing their standings as evaluated by the Shanghai Ranking Consultancy. Through this analysis, I aim to cast a critical eye on the validity of the ranking systems employed by organizations such as the SRC. Moreover, I seek to provoke thoughtful discourse on the factors that ought to be considered, or conversely, disregarded in the determination of institutional rankings.
