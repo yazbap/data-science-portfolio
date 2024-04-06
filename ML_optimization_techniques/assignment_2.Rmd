@@ -1,0 +1,563 @@
+---
+title: "Exploring Algorithmic Differences and Advanced Optimization Strategies in Machine Learning"
+output: html_document
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(glmnet)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+
+```
+
+### Description
+
+*This project delves into the fundamentals of machine learning, focusing on algorithmic disparities and advanced optimization techniques. It begins with a detailed examination of `train2()`, a stochastic gradient descent (SGD) algorithm with momentum, highlighting its role in addressing challenges like high variance in gradients. Additionally, the study proposes enhancements inspired by Nesterov Momentum to refine the optimization process.*
+
+*Part 2 involves advanced predictive modeling, aiming to construct highly predictive linear models without built-in cross-validation functions. By leveraging K-fold cross-validation and exhaustive exploration of polynomial degrees, the optimal model is identified, facilitating easy comparison of model variants. Finally, real-world applications are explored through civil war prediction using a LASSO regression model, showcasing the practical implications of machine learning in global peacekeeping efforts.*
+
+
+#### Part 1: Identifying Algorithmic Differences
+*See Appendix for definitions of `train` and `train2`*
+
+`Train2()` differs from the `train` algorithm in that it has an additional parameter `m` with the default set to 0.9. It also contains an additional vector `v` which has the same number of elements as coefficients in the model. These additional features turns this into a stochastic gradient descent (SGD) with momentum algorithm. In these types of algorithms, the `v` vector stores the history of the magnitude of the parameter update equation for the kth coefficient which is done on the line `v[k] <- m*v[k] + l_rate*(yhat_i - y[i])*row_vec[k]`. The `m` parameter controls how much weight previous updates have on the current update. In this case, a value of 0.9 means that previous updates have a strong influence on the current update. 
+
+To understand why adding momentum may be necessary, we first have to understand potential issues that can come up with SGD. Momentum is most helpful in cases where:
+
+-  **The objective function(s) have a lot of curvature.** In this scenario, the gradient may change a lot over small regions of the search space and since SGD does not take into account this information, coefficient updates may not be optimal. Momentum would provide this context.
+
+- **The gradient has a high variance.** In this scenario, small changes in the input data can lead to significant fluctuations in the gradient estimates. With SGD, small changes in the input data can lead to significantly different estimates, whereas with momentum, the context provided can lead to more optimal coefficient updates.
+
+- **When the search space is flat or, in other words, has a zero gradient.** This typically indicates a local minimum (or maximum) of the function. If the optimization algorithm relies solely on the gradient, it might get stuck in such regions, unable to make progress towards finding the global minimum. With momentum, we can provide the algorithm the inertia to the optimize the process, enabling it to traverse through flat regions and continue towards the global minimum or maximum of the objective function.
+
+(Brownlee, 2021)
+
+```{r functions}
+#=========================================================
+# Loss Functions
+#=========================================================
+
+MSE <- function(ytrue, yhat) {
+  return(mean((ytrue - yhat)^2)) # Return mean squared error
+}
+
+NLL <- function(ytrue, yhat) {
+  return(-sum(log((yhat^ytrue) * ((1 - yhat)^(1 - ytrue))))) # Return Negative Log Likelihood
+}
+
+ridgeLoss <- function(ytrue, yhat, coefficients, lambda) {
+  mse <- MSE(ytrue, yhat) # Calculate mean squared error
+  l2_penalty <- lambda*sum(coefficients^2) # Calculate ridge regression penalty
+  return(mse + l2_penalty) # Return sum of mse and penalty
+}
+
+#=========================================================
+# Train Functions
+#=========================================================
+train <- function(X, y, l_rate, epochs) {
+  
+  # Initialize coefficients to zeros
+  coefs <- rep(0, ncol(X))
+  
+  # Lists to store MSE and NLL for each epoch
+  MSE_list <- vector("numeric", length = epochs)
+  NLL_list <- vector("numeric", length = epochs)
+  
+  # Loop through each epoch
+  for (b in 1:epochs) {
+    
+    # Loop through each row of the data (in random order)
+    for (i in sample(1:nrow(X))) { 
+      
+      # Extract the predictor values for the current row
+      row_vec <- as.numeric(X[i,])
+      
+      # Predict the target variable for the current row
+      yhat_i <- predict_row(row_vec, coefficients = coefs)
+      
+      # Update coefficients using gradient descent
+      coefs <- sapply(1:length(coefs), function (k) {
+        coefs[k] - l_rate * (yhat_i - y[i]) * row_vec[k]
+      })
+    }
+    
+    # Calculate predictions for all data points
+    yhat <- apply(X, 1, predict_row, coefficients = coefs)
+    
+    # Calculate MSE and NLL for this epoch
+    MSE_epoch <- MSE(y, yhat)
+    NLL_epoch <- NLL(y, yhat)
+    
+    # Store MSE and NLL for this epoch
+    MSE_list[b] <- MSE_epoch
+    NLL_list[b] <- NLL_epoch
+  }
+  
+  # Set up the multi-panel layout for plotting
+  par(mfrow = c(1, 2))
+  
+  # Plot the MSE over epochs
+  plot(1:epochs, MSE_list, type = "l", 
+       xlab = "Epoch", 
+       ylab = "MSE", 
+       main = paste("Figure 1: train() MSE over Epochs \n (Learning Rate =", l_rate, ")"))
+  
+  # Plot the NLL over epochs
+  plot(1:epochs, NLL_list, type = "l", 
+       xlab = "Epoch", 
+       ylab = "NLL", 
+       main = paste("Figure 2: train() NLL over Epochs \n (Learning Rate =", l_rate, ")"))
+  
+  # Return the final estimates of coefficients
+  return(coefs)
+}
+
+train2 <- function(X, y, l_rate, m = 0.9, epochs) {
+  
+  # Initialize coefficients to zeros
+  coefs <- rep(0, ncol(X))
+  
+  # Initialize velocity to zeros
+  v <- rep(0, ncol(X))
+  
+  # Lists to store MSE and NLL for each epoch
+  MSE_list <- vector("numeric", length = epochs)
+  NLL_list <- vector("numeric", length = epochs)
+  
+  # Loop through each epoch
+  for (b in 1:epochs) {
+    
+    # Loop through each row of the data (in random order)
+    for (i in sample(1:nrow(X))) { 
+      
+      # Extract the predictor values for the current row
+      row_vec <- as.numeric(X[i,])
+      
+      # Predict the target variable for the current row
+      yhat_i <- predict_row(row_vec, coefficients = coefs)
+      
+      # Update coefficients using gradient descent with momentum
+      for(k in 1:length(coefs)) { # loop over each coefficient
+        
+        # Update velocity using momentum
+        v[k] <- m * v[k] + l_rate * (yhat_i - y[i]) * row_vec[k] 
+        
+        # Update the coefficient using the velocity
+        coefs[k] <- coefs[k] - v[k] # update the coefficient
+      }
+    }
+    
+    # Calculate predictions for all data points
+    yhat <- apply(X, 1, predict_row, coefficients = coefs)
+    
+    # Calculate MSE and NLL for this epoch
+    MSE_epoch <- MSE(y, yhat)
+    NLL_epoch <- NLL(y, yhat)
+    
+    # Store MSE and NLL for this epoch
+    MSE_list[b] <- MSE_epoch
+    NLL_list[b] <- NLL_epoch
+    
+  }
+  
+  # Set up the multi-panel layout for plotting
+  par(mfrow = c(1, 2))
+  
+  # Plot the MSE and NLL over epochs
+  plot(1:epochs, MSE_list, type = "l", 
+       xlab = "Epoch", ylab = "MSE", 
+       main = paste("Figure 3: train2() MSE over Epochs \n (Learning Rate =", l_rate, ")"))
+  
+  plot(1:epochs, NLL_list, type = "l", 
+       xlab = "Epoch", ylab = "NLL", 
+       main = paste("Figure 4: train2() NLL over Epochs \n (Learning Rate =", l_rate, ")"))
+  
+  return(coefs)  # Output the final estimates
+}
+
+#=========================================================
+# Data Simulation Functions
+#=========================================================
+genX_ex1 <- function(n) {
+  return(
+    data.frame(X0 = 1,  # Intercept term
+               X1 = runif(n, -5, 5),  # Random uniform values for X1 between -5 and 5
+               X2 = runif(n, -2, 2))  # Random uniform values for X2 between -2 and 2
+  )
+}
+
+genY_ex1 <- function(X) {
+  
+  # Linear relationship between features and target with added noise
+  Ylin <- 3*X$X0 + 1*X$X1 - 2*X$X2 + rnorm(nrow(X), 0, 0.05)
+  
+  # Apply logistic function to convert linear values to probabilities
+  Yp <- 1/(1+exp(-Ylin))
+  
+  # Generate binary outcomes based on the probabilities
+  Y <- rbinom(nrow(X), 1, Yp)
+  
+  return(Y)  # Return the generated target variable
+}
+
+# Define a function to generate example data with one feature
+genX_ex2 <- function(n) {
+  return (rnorm(n, 0, 1))  # Generate random normal values for X
+}
+
+
+genY_ex2 <- function(X, random_coefs) {
+  # Create simulated data with polynomials of X up to the 7th order
+  Ylin <- random_coefs[1] * X +
+     random_coefs[2] * X^2 +
+     random_coefs[3] * X^3 +
+     random_coefs[4] * X^4 +
+     random_coefs[5] * X^5 +
+     random_coefs[6] * X^6 +
+     random_coefs[7] * X^7 +
+     rnorm(length(X), mean = 0, sd = 0.5)  # Add random noise
+  
+  return(Ylin)  # Return the generated target variable
+}
+
+# Define a function to predict the target variable for a single row of data
+predict_row <- function(row, coefficients) {
+  
+  # Multiply each feature value by its corresponding coefficient
+  pred_terms <- row * coefficients
+  
+  # Sum up the products to get the linear prediction
+  yhat <- sum(pred_terms)
+  
+  # Apply logistic function to convert linear prediction to probabilities
+  return(1/(1+exp(-yhat)))
+}
+
+```
+
+
+
+```{r}
+#=========================================================
+# Exercise 1
+#=========================================================
+set.seed(89) # Set random seed
+
+X <- genX_ex1(1000) # Generate x values
+y <- genY_ex1(X) # Generate y values
+
+``` 
+
+#### Error Behavior
+
+As shown in Figures 1 and 2, `train()` is quickly able to lower both the Mean squared error (MSE) and Negative Log Likelihood (NLL) very dramaically within the first 10 epochs. In showing this plot, `train()` shows us how SGD makes larger steps toward the minima when it is farther away and gradually takes smaller steps as we approach the ideal coefficients for our model. 
+
+Figures 3 and 4 show the behavior of the errors for `train2()` which is much more erratic than `train()`. This shows us that momentum may bypass the ideal points for the coefficients, ultimately demonstrating we should use momentum only in certain contexts.
+
+```{r fig.width = 10, fig.height = 5}
+coef_model <- train(X = X, y = y, l_rate = 0.01, epochs = 50) # Train and produce plots
+```
+
+```{r fig.width = 10, fig.height = 5}
+coef_model2 <- train2(X = X, y = y, l_rate = 0.01, m = 0.9, epochs = 50) # Train and produce plots
+```
+
+#### General Constraints
+
+Unavoidable Constraints:
+
+- The utilization of momentum in optimization processes unavoidably increases memory requirements. This arises from the introduction of an additional term and hyperparameter that necessitate storage and ongoing updates. Depending on the storage you have available and the size of the problem, this may or not may be any issue.
+
+Algorithmic Improvements:
+
+- In the train2() function, the uniform contribution of momentum to the algorithm in each epoch may limit the optimization process. By introducing variability in the momentum's contribution to subsequent steps, we can achieve a more adaptive adjustment of the update size for model parameters. Taking inspiration from Nesterov Momentum, we can refine this approach further. Instead of solely updating the kth element of the v vector based on the partial derivative of the coefficient at its current position, we can calculate the partial derivative of the coefficient at the hypothetical new position it would attain if we calculated the velocity as per the `v[k]` update line in `train2()`. This anticipatory calculation allows us to better anticipate shifts in the gradient, particularly when approaching or surpassing the minima. In scenarios where the partial derivative indicates that the minima have been surpassed, we have the opportunity to dampen the momentum's influence on the update. This adaptive adjustment ensures that when we make a "mistake" in overshooting the global minima, we can correct it using an adaptive momentum scheme.
+
+- Alternatively, we can also add a weight decay term to the algorithm in which we store more data on previous updates of the coefficient. Older velocity data would weigh lighter on the current update while more recent velocity data would weigh heavier. However, this requires we store much more data in terms of the velocity instead of the current method in which the last update is the only point in which we consider.
+
+- A final adjustment we can do is use the loss functions to temper step size during stochastic gradient descent. If the value of the loss function we are using is above a certain threshold or greater than the previous loss, we can reduce how much the momentum contributes to the current update.
+
+## Part 2: Advanced Predictive Modeling: Optimal Model Selection with Cross-Validation and Polynomial Degree Exploration
+
+*See Appendix for definition of `train_optimal_model`*
+
+In this task, an analyst confronts the challenge of constructing highly predictive linear models without access to built-in cross-validation functions. Given a dataset with a continuous outcome variable y and a single continuous predictor x the objective was to develop the best model of the form $y=f(x)+λ⋅R(f)$, where f represents a linear model and both the regularization parameter ($\lambda$) and polynomial degrees up to the 7th order are adjustable to predict y.
+
+Through nested loops, `train_optimal_model` performs K-fold cross-validation to assess model performance, averting overfitting and providing reliable estimates of generalization error. To exhaustively explore potential model configurations, the code generates all subsets of polynomial degrees. The output of the function includes the optimal model form and the test loss, facilitating easy interpretation and comparison of model variants. This demonstrates adeptness in model formulation, hyperparameter tuning, cross-validation, and systematic problem-solving in predictive analytics.
+
+```{r}
+#=========================================================
+# Exercise 2
+#=========================================================
+set.seed(123)
+
+random_coefs <- runif(7, 0,1) # Generate random coefficients
+
+X <- genX_ex2(1000) # Generate 1000 rows
+y <- genY_ex2(X, random_coefs) # Generate y values
+
+```
+
+
+```{r ex_2}
+train_optimal_model <- function(x,y){
+  
+  # Initialize best values
+  best_lambda <- NULL
+  best_degree <- NULL
+  best_model <- NULL
+  best_loss <- Inf
+  
+  #set lambda values to loop through
+  lambdas <- c(0.0001, 0.001, 0.01, 0.1, 1, 10)
+  
+  #set polynomial degrees to loop through
+  poly_degrees <- seq(1, 7, by=1)
+  
+  all_subsets <- unlist(lapply(1:length(poly_degrees), 
+                               function(i) combn(poly_degrees, i, simplify = FALSE)), 
+                        recursive = FALSE)
+  
+  #set the number of folds
+  K <- 10
+  
+  train_idx <- sample(1:length(x), 0.8*length(x))
+  
+  #assign the training data
+  Xtrain <- x[train_idx]
+  ytrain <- y[train_idx]
+  
+  #assign the test data
+  Xtest <- x[-train_idx]
+  ytest <- y[-train_idx]
+  
+  #for each lambda value
+  for (lambda in lambdas){
+    
+    #for each polynomial degree
+    for (subset_degrees in all_subsets) {
+      
+      x_poly <- poly(Xtrain, degree = subset_degrees[1])
+      
+      if (length(subset_degrees) > 1) {
+        # Transform the x data to polynomial for each degree in subset_degrees
+        poly_degrees <- lapply(subset_degrees[-1], function(degree) poly(x_poly, degree = degree))
+        
+        # Bind all polynomial transformations to x_poly
+        x_poly <- cbind(x_poly, do.call(cbind, poly_degrees))
+      }
+      
+      # If polynomial degree is 1, add a column of ones
+      if (max(subset_degrees) == 1) {
+        x_poly <- cbind(x_poly, rep(1, nrow(x_poly)))
+      }
+  
+      #assign each observation to a fold
+      fold_id <- sample(rep(1:K, each = nrow(x_poly)/K))
+      
+      #set the total loss to 0 for this loop
+      total_loss <- 0
+      
+      #for each fold
+      for (k in 1:K){
+        #assign the training data
+        cv_train_X <- x_poly[fold_id != k,]
+        cv_train_y <- ytrain[fold_id != k]
+      
+        #assign the validation data
+        cv_val_X <- x_poly[fold_id == k,]
+        cv_val_y <- ytrain[fold_id == k]
+      
+        #create a model with this particular combination of polynomial and lambda using ridge regression
+        k_mod <- glmnet(as.matrix(cv_train_X), 
+                        cv_train_y, 
+                        family = "gaussian", 
+                        lambda = lambda, 
+                        alpha = 0)
+      
+        #make predictions with the model
+        yhat_k <- predict(k_mod, newx = as.matrix(cv_val_X), type = "response")
+        
+        #calculate the loss
+        k_loss <- ridgeLoss(cv_val_y, yhat_k, coef(k_mod), lambda)
+        
+        # Accumulate total loss
+        total_loss <- total_loss + k_loss
+        
+      }
+      
+        avg_loss <- total_loss / K
+  
+        #if the loss is less than the best test loss
+        if(avg_loss < best_loss){
+            
+            #set the best degree to this degree
+            best_degree <- subset_degrees
+            
+            #set the best lambda to this lambda
+            best_lambda <- lambda
+            
+            #set the best loss as this value
+            best_loss <- avg_loss
+        }
+      
+    }
+  }
+  
+    #Print the optimal model
+    cat("The best model includes degrees",
+        paste(best_degree, collapse = ", "),
+        "and the best lambda is", 
+        best_lambda)
+    
+    Xtrain <- poly(Xtrain, degree = best_degree[1])
+      
+    if (length(best_degree) > 1) {
+      # Transform the x data to polynomial for each degree in subset_degrees
+      poly_degrees <- lapply(best_degree[-1], function(degree) poly(Xtrain, degree = degree))
+      
+      # Bind all polynomial transformations to x_poly
+      Xtrain <- cbind(Xtrain, do.call(cbind, poly_degrees))
+    }
+    
+    best_model <- glmnet(as.matrix(Xtrain), 
+                        ytrain, 
+                        family = "gaussian", 
+                        lambda = lambda, 
+                        alpha = 0)
+    
+    Xtest <- poly(Xtest, degree = best_degree[1])
+      
+    if (length(best_degree) > 1) {
+      # Transform the x data to polynomial for each degree in subset_degrees
+      poly_degrees <- lapply(best_degree[-1], function(degree) poly(Xtest, degree = degree))
+      
+      # Bind all polynomial transformations to x_poly
+      Xtest <- cbind(Xtest, do.call(cbind, poly_degrees))
+    }
+    
+    #make predictions with the model
+    yhat_k <- predict(best_model, 
+                      newx = as.matrix(Xtest), 
+                      type = "response")
+    
+    #calculate the loss
+    best_loss <- ridgeLoss(ytest, yhat_k, coef(best_model), lambda)
+  
+    #Print the test loss of the optimal model
+    cat("\nThe loss of the optimal model is: ", best_loss)
+  
+    #return the model
+    return(best_model)
+}
+
+optimal_model <- train_optimal_model(X, y) # Train and print model
+
+```
+
+
+## Part 3: Predicting the onset of civil war
+
+The goal of this task was to predict civil war. Predicting civil wars is of paramount importance due to its implications for global peacekeeping efforts. Research by Hegre et al. (2019) suggests that increased investment in UN peacekeeping efforts could significantly reduce major world conflicts. In their work, they found that the UN could have transformed four to five conflicts from major conflict to minor conflict in 2013. This represents a 70% reduction in major conflicts that year. Therefore, effectively predicting where civil wars may occur becomes crucial in optimizing the allocation of peacekeeping resources.
+
+In my interpretation of this task I found the prediction of the onset of civil war instead of the presence of civil war was the most interesting social science question to answer, given most policymakers would be interested in preventing war. Moreover, given the presence of the predictor variable `warl` in this dataset, which indicates whether or not a war occurred in the previous year, predicting the presence of war is a question of "was the country at war the year before?". However, since we are likely to want to know if there will be a war far in advance, this variable is not as useful for the predictive issue at hand. Below is a tree demonstrating the power of the `warl` variable in predicting the presence of war.
+
+```{r}
+load("civil_wars.RData")
+
+tree_mod <- rpart(war ~ ., civwars, method = "class")
+rpart.plot(tree_mod)
+
+```
+
+The model I trained to solve this problem utilized LASSO regularization. I used LASSO regression because of findings from Ward, Greenhill, and Bakke (2010), where they suggested that a parsimonious model, which can be facilitated by LASSO regression, outperforms models with many significantly associated independent and dependent variables in predicting civil war occurrences. I also used cross validation to find the best lambda value. To assess the performance of the final trained model, I employed a Receiver Operating Characteristic (ROC) curve which has an AUC of 1  which indicates this model predicts war with 100% accuracy, sensitivity and specificity. 
+
+
+```{r}
+#=========================================================
+# Exercise 3
+#=========================================================
+predict_civ_war <- function(civwar){
+  
+  # Set the training index
+  train_idx <- sample(1:nrow(civwar), 0.8 * nrow(civwar))
+  
+  # Set xtrain
+  Xtrain <- civwar[train_idx, ]
+  # Set x test
+  Xtest <- civwar[-train_idx, ]
+  
+  # Set y train
+  ytrain <- Xtrain$onset
+  
+  # Set y test as vector to create ROC curve
+  ytest <- as.vector(Xtest$onset)
+  
+  # Remove 'onset' and 'war' columns from both training and test sets
+  Xtrain <- Xtrain[, !(names(Xtrain) %in% c("onset", "war"))]
+  Xtest <- Xtest[, !(names(Xtest) %in% c("onset", "war"))]
+  
+  # Use cv.glmnet to estimate the best value for lambda
+  lasso_cv <- cv.glmnet(as.matrix(Xtrain), ytrain, alpha = 1)
+  
+  # Get the value of lambda
+  lambda_min <- lasso_cv$lambda.min
+  
+  # Train final model
+  final_mod <- glmnet(as.matrix(Xtrain), ytrain, alpha = 1, lambda = lambda_min)
+  
+  # Predict test outcomes
+  ypred <- predict(final_mod, newx = as.matrix(Xtest))
+  ypred <- as.vector(ypred) #set as vector for ROC curve
+  
+  # Calculate the AUC
+  roc_data <- roc(ytest, ypred)
+  auc <- auc(roc_data)
+  
+  # Plot ROC curve
+  plot.roc(roc_data, 
+           col = "blue", 
+           main = "ROC Curve for Civil War Data", 
+           lwd = 2)
+  
+  return(final_mod)
+}
+
+model <- predict_civ_war(civwars) # train model and print ROC curve
+```
+
+Below is a table that shows the top 5 variables that have the greatest impact on the outcome variable `onset`. Of greatest importance are the variables `emponset`, `ethonset` and `empethfrac`. These variables indicate that civil wars happen often due to ethnic tensions and within countries that were previously under a colonial empire.
+
+```{r}
+# Extract coefficients
+coefficients <- coef(model)
+
+# Extract variable names
+variable_names <- rownames(coefficients)[-1]  # Exclude intercept
+
+# Extract coefficient values
+coefficient_values <- as.vector(coefficients[-1])  # Exclude intercept
+
+# Create a data frame for easier manipulation
+coefficients_df <- data.frame(Variable = variable_names, Coefficient = coefficient_values)
+
+# Select the top 5 predictors based on coefficient magnitude
+top_5_predictors <- coefficients_df[order(abs(coefficients_df$Coefficient), decreasing = TRUE), ][1:5, ]
+
+# Print the top 5 predictors
+print(top_5_predictors)
+```
+
+## References
+
+Brownlee J. (2021, October 12). Gradient Descent With Momentum from Scratch. Machine Learning Mastery. https://machinelearningmastery.com/gradient-descent-with-momentum-from-scratch/
+
+Hegre, H., Hultman, L., & Nygård, H. M. (2019). Evaluating the conflict-reducing effect of UN peacekeeping operations. The Journal of Politics, 81(1), 215-232.
+
+Ward, M. D., Greenhill, B. D., & Bakke, K. M. (2010). The perils of policy by p-value: Predicting civil conflicts. Journal of peace research, 47(4), 363-375.
+
+## Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+```
