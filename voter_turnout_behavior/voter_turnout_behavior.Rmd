@@ -1,0 +1,590 @@
+---
+title: "Understanding Voter Turnout Behavior: Insights for Non-Partisan Engagement"
+date: "April 2024"
+output: html_document
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+#load packages
+library("lightgbm")
+library("missForest")
+library("ggplot2")
+library("dplyr")
+library("haven")
+library("glmnet")
+library("tidyr")
+library("fixr")
+library("smotefamily")
+library("caret")
+library("RSQLite")
+library("randomForest")
+library("patchwork")
+```
+
+```{r}
+# Function to remove prefixes from column names
+remove_prefixes <- function(df) {
+  
+  # Rename columns by removing prefixes (including underscores)
+  new_names <- gsub("^.*?_", "", names(df))
+  
+  # Assign the new names back to the df
+  names(df) <- new_names
+  
+  return(df)
+}
+
+# Function to rename columns based on starting patterns
+rename_columns_based_on_start <- function(df) {
+  df <- df %>%
+    rename_with(~ gsub("^332", "abortion_", .x), starts_with("332")) %>%
+    rename_with(~ gsub("^323", "abortion_", .x), starts_with("323")) %>%
+    rename_with(~ gsub("^333", "climate_change_", .x), starts_with("333")) %>%
+    rename_with(~ gsub("^324", "climate_change_", .x), starts_with("324")) %>%
+    rename_with(~ gsub("^309", "covid_", .x), starts_with("309")) %>%
+    rename_with(~ gsub("^305", "covid_", .x), starts_with("305")) %>%
+    rename_with(~ gsub("^330", "gun_control_", .x), starts_with("330")) %>%
+    rename_with(~ gsub("^321", "gun_control_", .x), starts_with("321")) %>%
+    rename_with(~ gsub("^327", "healthcare_", .x), starts_with("327")) %>%
+    rename_with(~ gsub("^320", "healthcare_", .x), starts_with("320")) %>%
+    rename_with(~ gsub("^331", "immigration_", .x), starts_with("331")) %>%
+    rename_with(~ gsub("^322", "immigration_", .x), starts_with("322")) %>%
+    rename_with(~ gsub("^300", "media_", .x), starts_with("300")) %>%
+    rename_with(~ gsub("^334", "police_", .x), starts_with("334")) %>%
+    rename_with(~ gsub("^440", "racial_resent_", .x), starts_with("440"))
+  
+  return(df)
+}
+
+# Function to make 2 df's have the same columns
+fill_missing_columns <- function(df1, df2) {
+  
+  # Get missing columns in df1 compared to df2
+  missing_in_df1 <- setdiff(names(df2), names(df1))
+  
+  # Add missing columns to df1 and fill with NA
+  if (length(missing_in_df1) > 0) {
+    df1[, missing_in_df1] <- NA
+  }
+  
+  # Get missing columns in df2 compared to df1
+  missing_in_df2 <- setdiff(names(df1), names(df2))
+  
+  # Add missing columns to df2 and fill with NA
+  if (length(missing_in_df2) > 0) {
+    df2[, missing_in_df2] <- NA
+  }
+  
+  return(list(df1, df2))
+}
+
+# Function to compute variable importance for a given model object
+varImp <- function(object, lambda = NULL, ...) {
+  
+  # Predict coefficients for the specified lambda value
+  beta <- predict(object, s = lambda, type = "coef")
+  
+  # Check if the coefficients are in a list format (e.g., for models with multiple classes)
+  if (is.list(beta)) {
+    
+    # If coefficients are in a list format, extract the first column of each and combine them
+    out <- do.call("cbind", lapply(beta, function(x) x[,1]))
+    
+    # Convert the result into a data frame
+    out <- as.data.frame(out, stringsAsFactors = TRUE)
+  } else {
+    
+    # If coefficients are not in a list format use the first column
+    out <- data.frame(Overall = beta[,1])
+  }
+  
+  # Remove the "(Intercept)" row from the output
+  out <- abs(out[rownames(out) != "(Intercept)", , drop = FALSE])
+  
+  # Return the variable importance
+  return(out)
+}
+
+# Find the best parameters for a lightgbm model
+random_search_lgbm <- function(parameter_values_fixed,
+                              n_draws,
+                              training_dataset,
+                              seed_int) {
+
+  ## 1. Status update
+  
+  print("Starting the random hyper-parameter search ..")
+  
+  ## 2. Create a data frame to store the outcomes
+
+  search_output <- data.frame(learning_rate = numeric(),
+                             num_leaves = numeric(),
+                             max_depth = numeric(),
+                             feature_fraction = numeric(),
+                             bagging_fraction = numeric(),
+                             is_unbalance = logical(),
+                             score = numeric(),
+                             lambda_l1 = numeric(),
+                             lambda_l2 = numeric(),
+                             min_split_gain = numeric(),
+                             subsample = numeric(),
+                             colsample_bytree = numeric(),
+                             max_drop = numeric())
+  
+  
+  ## 3. Training the models
+  
+  # Set seed
+  set.seed(seed_int)
+  
+  # Iterations
+  for (ii in 1:n_draws) {
+    
+    # Picking a random point in the hyper-parameter space and storing it
+    search_output[ii, "learning_rate"] <- exp(runif(1, min = -4.6, max = -0.7)) 
+    search_output[ii, "num_leaves"] <- round(runif(1, min = 2, max = 200))
+    search_output[ii, "max_depth"] <- round(runif(1, min = 1, max = 30))
+    search_output[ii, "feature_fraction"] <- runif(1, min = .6, max = 1) #updated from previous runs
+    search_output[ii, "bagging_fraction"] <- runif(1, min = 0, max = 1)
+    search_output[ii, "is_unbalance"] <- sample(c(TRUE, FALSE), 1)
+    search_output[ii, "lambda_l1"] <- exp(runif(1, min = -6, max = 2))
+    search_output[ii, "lambda_l2"] <- exp(runif(1, min = -6, max = 2))
+    search_output[ii, "min_split_gain"] <- runif(1, min = 0.0, max = 0.1)
+    search_output[ii, "subsample"] <- runif(1, min = 0.7, max = 1)
+    search_output[ii, "colsample_bytree"] <- runif(1, min = 0.5, max = 1)
+    search_output[ii, "max_drop"] <- round(runif(1, min = 40, max = 50))
+    
+    # Transforming the parameter values into a list
+    parameter_values_variable <- as.list(search_output[ii, !(colnames(search_output) %in% "score")])
+
+    # Combining with fixed parameters and seed
+    current_params <- c(parameter_values_fixed, parameter_values_variable, list(seed = seed_int))
+    
+    # Cross validation
+    sink(tempfile()) # prevents printouts as verbose=-1
+    current_cv <- lgb.cv(
+      params = current_params,
+      data = training_dataset,
+      nrounds = 500,
+      nfold = 5,
+      verbose = -1
+    )
+    sink()
+
+    # Storing the score in the final boosting round
+    search_output[ii,"score"] <- current_cv$record_evals$valid$auc$eval[[500]]
+    
+    # Status update
+    if (ii %% 50 == 0) {
+      
+      print(sprintf("%s/%s models trained.", ii, n_draws))
+      
+    }
+    
+  }
+  
+  # Sorting to obtain parameter combination with the best score first
+  search_output <- search_output[order(-search_output$score),]
+  
+  return(search_output)
+  
+}
+```
+
+<br />
+
+#### Data Selection
+
+To begin the process of developing a model to forecast individual voting turnout behavior, appropriate data sets were identified. The Cooperative Election Study (CES) provided comprehensive information, with both a cumulative dataset spanning from 2006 to 2022, consisting of standardized variables across the years the survey was administerd, and year-specific datasets which expanded on information not included in the cumulative file. Given its pre-organized structure and inclusion of cross-year data, this cumulative dataset served as a starting point for addressing the prediction problem while the year-specific data sets built upon it. The data was narrowed down to include only information from 2020 to 2022 to ensure relevance and recency. Rows lacking labeled data for the outcome variable were filtered out, but this only led to a 4% decrease in the dataset, necessary for the supervised learning approach.
+
+```{r}
+# Establish directory to database
+database = 'database/training_data.db'
+
+```
+
+```{r}
+# Read in data
+cumulative <- readRDS("cumulative_2006-2022.rds")
+
+df_2022 <- read_dta("2022_data/CCES22_Common_OUTPUT_vv_topost.dta")
+df_2021 <- read_dta("2021_data/CCES21_Common_OUTPUT.dta")
+df_2020 <- read_dta("2020_data/CES20_Common_OUTPUT_vv.dta")
+
+```
+
+```{r}
+# Filter to only 2020 data and after
+cumulative_filtered <- cumulative %>%
+  
+  # Filter to rows that have labeled data for relevant years
+  filter((!is.na(intent_turnout_self) & !is.na(vv_turnout_gvm)) & year >= 2020)
+
+# Get outcome variables
+outcome_vars <- cumulative_filtered %>%
+  select(case_id, vv_turnout_gvm, intent_turnout_self)
+
+# Get predictor variables
+predictors <- cumulative_filtered %>%
+  
+  # Select columns with relevant demographic and political opinion data
+  select(case_id, pid3, ideo5, gender, age, race, 
+         citizen, educ, marstat, faminc, union, union_hh, employ, 
+         no_healthins, has_child, ownhome, no_milstat, religion, relig_imp,
+         newsint, approval_pres, approval_gov, economy_retro, vv_regstatus) %>%
+  
+  # Change all factor data to numeric
+  mutate_if(is.factor, as.numeric) %>% 
+  
+  #replace all spaces with an underscore
+  fix_col_spaces(.)
+
+# Set levels for outcome variable
+vote_levels <- c("Yes, definitely", "No" )
+
+# Use the verified voting data, otherwise, use the intent data
+outcome_vars_processed <- outcome_vars %>%
+  
+  mutate(will_vote = case_when(
+    vv_turnout_gvm == "Voted" ~ "Yes, definitely", #has a record of voting
+    vv_turnout_gvm %in% "No Record of Voting" ~ "No", #has no record of voting
+    intent_turnout_self == "I already voted (early or absentee)" ~ "Yes, definitely", 
+    intent_turnout_self == "Plan to vote early" ~ "Yes, definitely",
+    intent_turnout_self == "Probably" ~ "Probably/Undecided",
+    intent_turnout_self == "Undecided" ~ "Probably/Undecided",
+    is.na(vv_turnout_gvm) ~ as.character(intent_turnout_self),
+    TRUE ~ as.character(intent_turnout_self)
+  )) %>%
+  
+  # Convert outcome variable to a factor with specified levels
+  mutate(will_vote = factor(will_vote, levels = vote_levels)) %>%
+  
+  select(case_id, will_vote)
+```
+
+<br />
+
+#### Outcome Variable Granularity and Imbalance
+
+The outcome variable initially considered was vote intention, yet its granularity, with six levels, exceeded the information necessary for this prediction task. Figure 1 displays the levels for vote intention as well as their propotion in the data. Moreover, intending to vote does not always equate to actual voting turnout behavior. Thus, a new outcome variable was constructed by merging `vv_turnout_gvm`, which provides validated voting information, with `intent_turnout_self` if validated voting information was not available. This approach resulted in a binary outcome variable reflecting more accurate turnout behavior, and a more balanced outcome variable. Analysis revealed that a majority of those who responded "Probably" or "Undecided" with their intent to vote actually ended up not voting and some people who reported they already voted early didn't vote at all, indicating a disparity between intention and action. Consequently, the refined outcome variable comprised two levels, addressing both granularity and imbalance concerns which is shown in Figure 2.
+
+<br />
+
+```{r,fig.height = 8, fig.width = 20, fig.align = 'center'}
+library(cowplot)
+# Calculate the number of rows
+total_count <- nrow(outcome_vars)
+
+# Plot classes in the intent_turnout_self col
+p1 <- ggplot(outcome_vars, aes(y = reorder(intent_turnout_self, -as.numeric(intent_turnout_self)))) +
+  geom_bar(position = "dodge", fill = "blue") +
+  scale_x_continuous(labels = function(x) scales::percent(as.numeric(x) / total_count)) +
+  labs(title = "Figure 1 \nOutcome Variable Pre-Processing", y = "Vote Intention Classification", x = "Proportion") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),   # Adjust the size of axis text
+    axis.title = element_text(size = 20),  # Adjust the size of axis titles
+    plot.title = element_text(size = 24)   # Adjust the size of the plot title
+  )
+
+p1 <- p1 + scale_y_discrete(labels = function(x) gsub("early or absentee", "\nearly/absentee", x))
+
+# Plot the will_vote column
+p2 <- ggplot(outcome_vars_processed, aes(y = reorder(will_vote, -as.numeric(will_vote)))) +
+  geom_bar(position = "dodge", fill = "blue") +
+  scale_x_continuous(labels = function(x) scales::percent(as.numeric(x) / total_count)) +
+  labs(title = "Figure 2 \nOutcome Variable Post-Processing", y = "Vote Intention Classification", x = "Proportion") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),   # Adjust the size of axis text
+    axis.title = element_text(size = 20),  # Adjust the size of axis titles
+    plot.title = element_text(size = 24)   # Adjust the size of the plot title
+  )
+
+plot_grid(p1, p2, ncol = 2, hjust = -15, vjust = 15)
+
+```
+
+
+```{r}
+# Keep cols on abortion, climate change, covid, Economy, gun control, healthcare, 
+#immigration, media, police and Racial Resentment/Sexism
+df_2022_filtered <- df_2022 %>%
+  select(caseid, matches(paste0("^CC22_332|^CC22_333|^CC22_309",
+  "|^CC22_330|^CC22_327|^CC22_331|^CC22_300|^CC22_334|^CC22_440")) )
+
+#no police or racial resentment data for 2021
+df_2021_filtered <- df_2021 %>%
+  select(caseid, matches(paste0("^CC21_323|^CC21_324|^CC21_305",
+  "|^CC21_321|^CC21_320|^CC21_322|^CC21_300")) )
+
+df_2020_filtered <- df_2020 %>%
+  select(caseid, matches(paste0("^CC20_332|^CC20_333|^CC20_309",
+  "|^CC20_330|^CC20_327|^CC20_331|^CC20_300|^CC20_334|^CC20_440")) )
+
+```
+
+```{r}
+# Remove pre-fixes for each df
+df_2022_prefix <- remove_prefixes(df_2022_filtered)
+df_2021_prefix <- remove_prefixes(df_2021_filtered)
+df_2020_prefix <- remove_prefixes(df_2020_filtered)
+
+```
+
+```{r}
+# Apply more descriptive names to columns
+df_2022_cols <- rename_columns_based_on_start(df_2022_prefix)
+df_2021_cols <- rename_columns_based_on_start(df_2021_prefix)
+df_2020_cols <- rename_columns_based_on_start(df_2020_prefix)
+
+```
+
+```{r}
+# Ensure consistency between columns of datasets from 2022 and 2021
+filled_dfs_2022_2021 <- fill_missing_columns(df_2022_cols, df_2021_cols)
+
+# Concatenate datasets from 2022 and 2021
+df_2022_2021 <- rbind(filled_dfs_2022_2021[[1]], filled_dfs_2022_2021[[2]])
+
+# Ensure consistency between columns of combined dataset from 2022-2021 and dataset from 2020
+filled_dfs_full <- fill_missing_columns(df_2022_2021, df_2020_cols)
+
+# Concatenate datasets from 2022-2021 and 2020
+df_full <- rbind(filled_dfs_full[[1]], filled_dfs_full[[2]] )
+
+# Replace NA's and skipped questions with an impossible response number
+df_full_filled <- df_full %>%
+  mutate(across(where(is.numeric), ~ifelse(is.na(.), 99, .))) %>%
+  select(-"covid_d_t") # Remove column with "other" responses
+
+# Identify columns where surveyors describe their political opinion
+columns_to_replace <- c("approval_pres", "approval_gov", "economy_retro")
+
+# Replace missing values with 99
+predictors <- predictors %>%
+  mutate(across(all_of(columns_to_replace), ~ ifelse(is.na(.), 99, .)))
+
+```
+
+```{r}
+# Join the cleaned predictors with the outcome variable
+cumulative_full <- left_join(predictors, outcome_vars_processed)
+
+# Join predictors from the cumulative df with those from year-specific ones
+cumulative_full_opinions <- left_join(cumulative_full, df_full_filled, by = c("case_id" = "caseid"))
+
+# adjust labels to start from 0
+cumulative_full_opinions$will_vote <- as.numeric(cumulative_full_opinions$will_vote) - 1
+
+```
+
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Set proportions of data for split
+train_prop <- 0.8
+test_prop <- 0.2
+
+# Sample indices for training set
+train_idx <- sample(1:nrow(cumulative_full_opinions), train_prop * nrow(cumulative_full))
+
+# Remaining indices are for test df
+test_idx <- setdiff(1:nrow(cumulative_full_opinions), train_idx)
+
+```
+
+```{r}
+# Set up training dfs
+Xtrain <- cumulative_full_opinions[train_idx, !names(cumulative_full_opinions) == "will_vote"]
+ytrain <- cumulative_full_opinions[train_idx, names(cumulative_full_opinions) == "will_vote"]
+
+# Set up test dfs
+Xtest <-  cumulative_full_opinions[test_idx, !names(cumulative_full_opinions) == "will_vote"]
+ytest <-  cumulative_full_opinions[test_idx, names(cumulative_full_opinions) == "will_vote"]
+
+```
+
+```{r, eval = FALSE}
+# Only get rows with some type of missing values to speed up imputation
+Xtrain_na <- Xtrain %>%
+  select(case_id, ideo5, citizen, marstat, faminc, union, union_hh, employ, 
+         religion, relig_imp, newsint, has_child, ownhome) %>%
+  mutate_all(as.numeric) %>%
+  filter(!complete.cases(.))
+
+```
+
+```{r, eval = FALSE}
+# Use missForest to impute data
+imputed_data <- missForest(Xtrain_na)
+
+imputed_df <- round(imputed_data$ximp)
+
+# Fill in missing values with those imputed from missForest
+xtrain_coalesced <- Xtrain %>% 
+  left_join(imputed_df, by= "case_id") %>%
+  mutate(ideo5 = coalesce(ideo5.x, ideo5.y),
+         citizen = coalesce(citizen.x, citizen.y),
+         marstat = coalesce(marstat.x, marstat.y),
+         faminc = coalesce(faminc.x, faminc.y),
+         union = coalesce(union.x, union.y),
+         union_hh = coalesce(union_hh.x, union_hh.y),
+         employ = coalesce(employ.x, employ.y),
+         religion = coalesce(religion.x, religion.y),
+         relig_imp = coalesce(relig_imp.x, relig_imp.y),
+         newsint = coalesce(newsint.x, newsint.y),
+         has_child = coalesce(has_child.x, has_child.y),
+         ownhome = coalesce(ownhome.x, ownhome.y)) %>%
+  select(-ends_with(".x"), -ends_with(".y"))
+
+```
+
+```{r eval = FALSE}
+# Write imputed data into SQL database to reduce knitting time
+db <- dbConnect(RSQLite::SQLite(), database) #connect
+dbWriteTable(db, "voting_training_data", xtrain_coalesced, overwrite = TRUE) # Write
+dbWriteTable(db, "imputed_training_data", imputed_df) # Write
+dbDisconnect(db)
+```
+
+
+```{r}
+# Get imputed data from database
+db <- dbConnect(RSQLite::SQLite(), database) # Connect
+Xtrain <- dbGetQuery(db,
+                        "SELECT *
+                        FROM voting_training_data") # Conduct query
+imputed_df <- dbGetQuery(db,
+                        "SELECT *
+                        FROM imputed_training_data") # Conduct query
+dbDisconnect(db) # Disconnect
+```
+
+<br />
+
+#### Feature Selection and Handling Missing Data
+
+Initially, a wide array of 180 columns were included in the dataset, recognizing the potential predictive value of diverse features. Basic demographic data like age, family income and marital status were included along with a wide range of individuals' opinions on political issues like COVID, police reform and the economy. Among these, 12 demographic columns contained missing data, each with less than 1% of missing rows. To address this, I employed MissForest for imputation. Figure 3 displays density plots comparing the distribution of imputed variables with the original values, with the column names represented on the x-axis. Given the similarity in the distribution of densities and after comparing the suitability of this imputation with that produced from the [MICE](https://cran.r-project.org/web/packages/mice/mice.pdf) package, missForest proved to be the best option. 
+
+For missing values in political opinion columns, they were recoded as 99. Considering these values mainly resulted from skipped questions due to survey logic, in which the question was deemed irrelevant to the individual, it was important to document that these questions were missing instead of imputing them. In some cases the question was skipped intentionally by the indiividual but the CEC docuented this occurence within the data.
+
+<br />
+
+```{r fig.align='center'}
+# Get complete cases from Xtrain for graph
+complete_cases_Xtrain_na <- na.omit(Xtrain)
+
+# Create a list to store density plots
+density_plots <- list()
+
+# Loop through each column in imputed dataset
+for (col_name in names(imputed_df)) {
+  if (col_name == "case_id") {
+    next
+  }
+  
+  # Create density plot for the imputed column
+  density_imputed <- density(imputed_df[, col_name])
+  
+  # Create density plot for the original column
+  density_original <- density(complete_cases_Xtrain_na[[col_name]])
+  
+  # Combine densities into a dataframe for ggplot
+  density_data <- data.frame(
+    x = c(density_imputed$x, density_original$x),
+    density = c(density_imputed$y, density_original$y),
+    dataset = rep(c("Imputed", "Original"), each = length(density_imputed$x)),
+    column = col_name  # Add column name as identifier
+  )
+  
+  # Create density plot
+  density_plots[[col_name]] <- ggplot(density_data, aes(x = x, y = density, color = dataset, group = dataset)) +
+    geom_line() +
+    labs(x = paste("Values of", col_name)) +
+    theme_minimal()  # Optional: Change the theme if desired
+}
+
+# Combine density plots into a grid
+combined_plots <- NULL
+for (col_name in names(density_plots)) {
+  plot <- density_plots[[col_name]] + theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = NULL, x = paste("Value of", col_name), y = "Density")
+  
+  combined_plots <- if (is.null(combined_plots)) {
+    plot
+  } else {
+    combined_plots / plot
+  }
+}
+
+# Set the layout
+combined_plots <- combined_plots + 
+  plot_layout(guides = 'collect', ncol = 3) +
+  plot_annotation(title = "Figure 3: Density of Original vs. Imputed Data for each feature with missing variables")
+
+# Display the grid of plots
+combined_plots
+```
+
+```{r}
+# Train lasso model
+model_lasso <- cv.glmnet(as.matrix(Xtrain), ytrain)
+
+# Extract the importance of features
+var_imp <- varImp(model_lasso, lambda = model_lasso$lambda.min)
+
+# Filter features based on coefficient threshold
+var_imp_filtered <- var_imp %>%
+  filter(Overall >= 0.03)
+
+# Select only the most relevant features for training the model
+Xtrain_selected <- Xtrain %>%
+  select(rownames(var_imp_filtered))
+```
+
+<br />
+
+#### Model Selection and Evaluation
+
+In selecting a model, considerations were made to balance interpretability, simplicity, and accuracy. Initially, a LASSO regression model was applied to filter features, retaining only those with a coefficient greater than or equal to 0.03. Subsequently, a random forest model was trained using the selected 6 features, leveraging its capability to capture nonlinear relationships. Despite the LASSO regression's inability to capture such relationships, its use enhanced model simplicity without sacrificing accuracy. Evaluation on test data revealed a 93% accuracy, with a 95% confidence interval between 92% and 93%. However, sensitivity (0.90) was lower than specificity (0.98), indicating the model's higher accuracy in predicting voters than non-voters. Attempts to improve accuracy through SMOTE and adding additional features eliminated through LASSO did not increase the model's overall accuracy over 93% nor did these improve sensitivity. Therefore, given the model's high accuracy with only six variables, this model achieves the simplicity and accuracy needed for this task. 
+
+```{r, eval = FALSE}
+# Train the random forest model
+model_rf <- randomForest(as.factor(Xtrain_selected)~., data=Xtrain_selected, 
+                        mtry = round(sqrt(ncol(Xtrain_selected)), 0), 
+                        importance=TRUE)
+
+# Save random forest model to save time on knitting
+saveRDS(model_rf, file = "rf_voting_intent.rda")
+```
+
+```{r}
+# Get random forest model
+model_rf <- readRDS("rf_voting_intent.rda")
+
+# Prediction of classes
+predicted_probs <- predict(model_rf, newdata = Xtest)
+```
+
+<br />
+
+#### Variables of Importance
+
+Variable importance analysis identified registration status as the most influential predictor of voting behavior. This underscores the potential effectiveness of voter registration campaigns in increasing voter turnout. Since citizenship status is a requirement of being able to vote, its inclusion in voter turnout behavior also makes sense. Additionally, engagement with  media (`media_2`) as well as individuals' opinions on the government's handling of the pandemic economically and in terms of public health (`covid_ ` questions) emerged as important predictors. Interestingly, healthcare and economic issues were also the most important issues to voters in 2020 according to the [Pew Research Center](https://www.pewresearch.org/politics/2020/08/13/important-issues-in-the-2020-election/). Given that voter concerns change over time, future iterations of this model may include new political opinion questions that the CES asks to ensure its capturing the most important political issues to voters which may help predict voter turn out.
+
+To find the columns that correspond with these variables please see the function `rename_columns_based_on_start` which identifies the column name provided by the CES with the features presented below. The columns were renamed for easier interprebility while data processing.
+
+```{r}
+varImpPlot(model_rf, main = "Variable Importance from Random Forest Model")
+```
+
+
+## Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+```
